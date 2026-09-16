@@ -2,3 +2,5 @@ python-telegram-bot==20.7
 nest-asyncio==1.6.0
 python-telegram-bot==20.5
 nest-asyncio==1.6.0
+python-telegram-bot==20.5
+nest-asyncio==1.6.0
