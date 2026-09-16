@@ -7,12 +7,7 @@ from telegram.ext import (
     CallbackQueryHandler, MessageHandler, filters, ContextTypes
 )
 
-# Fix for macOS event loop issues
-try:
-    import nest_asyncio
-    nest_asyncio.apply()
-except ImportError:
-    pass
+# Note: nest_asyncio is not needed with python-telegram-bot v20.5+ Application API
 
 # Database setup
 DB_FILE = "ice_box_bookings.db"
@@ -711,15 +706,10 @@ async def run_bot():
         raise
 
 def main():
-    """Start the bot with proper event loop handling."""
+    """Start the bot asynchronously."""
     import asyncio
-    import sys
 
     try:
-        # Handle macOS specific event loop issue
-        if sys.platform == 'darwin':
-            asyncio.set_event_loop(asyncio.new_event_loop())
-
         asyncio.run(run_bot())
     except Exception as e:
         print(f"Error in main: {e}")
