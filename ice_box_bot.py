@@ -180,17 +180,22 @@ def get_user_bookings(user_id, include_returned=False):
         print(f"Error getting user bookings: {e}")
         return []
 
-def get_all_bookings():
-    """Get all bookings from everyone."""
+def get_all_bookings(include_returned=False):
+    """Everyone's bookings. Returned ones are hidden by default so the shared
+    list only shows boxes still out. /admin_returns passes include_returned=True
+    because tracking returns is exactly its job."""
     try:
         conn = sqlite3.connect(DB_FILE)
         cursor = conn.cursor()
 
-        cursor.execute('''
+        sql = '''
             SELECT id, user_name, ice_box_id, start_time, end_time, booking_date
             FROM bookings
-            ORDER BY booking_date, ice_box_id, start_time
-        ''')
+        '''
+        if not include_returned:
+            sql += " WHERE is_returned = 0"
+        sql += " ORDER BY booking_date, ice_box_id, start_time"
+        cursor.execute(sql)
 
         bookings = cursor.fetchall()
         conn.close()
@@ -333,7 +338,7 @@ async def admin_returns(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("❌ Access denied. Only admin can view this.")
             return
 
-        bookings = get_all_bookings()
+        bookings = get_all_bookings(include_returned=True)
 
         if not bookings:
             await update.message.reply_text("📭 No bookings yet.")
@@ -384,12 +389,9 @@ async def admin_returns(update: Update, context: ContextTypes.DEFAULT_TYPE):
         print(f"Error in admin_returns: {e}")
         await update.message.reply_text("❌ Error retrieving admin data.")
 
-async def admin_photo_viewer(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """View a specific return photo (admin)."""
+async def send_return_photo(query, context):
+    """Send the stored return photo for the booking named in query.data."""
     try:
-        query = update.callback_query
-        await query.answer()
-
         booking_id = int(query.data.split("_")[2])
 
         conn = sqlite3.connect(DB_FILE)
@@ -408,12 +410,19 @@ async def admin_photo_viewer(update: Update, context: ContextTypes.DEFAULT_TYPE)
                     parse_mode="Markdown"
                 )
             else:
-                await query.answer("No photo found.", show_alert=True)
+                await query.answer("No photo found for this return.", show_alert=True)
         else:
             await query.answer("Booking not found.", show_alert=True)
     except Exception as e:
-        print(f"Error in admin_photo_viewer: {e}")
+        print(f"Error sending return photo: {e}")
         await query.answer("Error retrieving photo.", show_alert=True)
+
+async def admin_photo_viewer(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """View a return photo (admin). Reached only when no conversation is
+    active; otherwise button_callback routes to send_return_photo directly."""
+    query = update.callback_query
+    await query.answer()
+    await send_return_photo(query, context)
 
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle button presses."""
@@ -427,6 +436,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             dates = generate_date_buttons()
             keyboard = [[InlineKeyboardButton(label, callback_data=f"date_{date_str}")]
                         for label, date_str in dates]
+            keyboard.append([InlineKeyboardButton("🔙 Back to Menu", callback_data="back_to_menu")])
             reply_markup = InlineKeyboardMarkup(keyboard)
             await query.edit_message_text(
                 "📅 Select a date:",
@@ -598,6 +608,13 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return CONFIRM_RETURN_PHOTO
 
+        elif query.data.startswith("admin_photo_"):
+            # The conversation's catch-all CallbackQueryHandler is registered
+            # ahead of the dedicated admin handler and would otherwise swallow
+            # this callback, so the photo is sent from here.
+            await send_return_photo(query, context)
+            return MAIN_MENU
+
         elif query.data.startswith("view_photo_"):
             booking_id = int(query.data.split("_")[2])
             bookings = get_user_bookings(query.from_user.id, include_returned=True)
@@ -661,9 +678,13 @@ async def receive_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     reply_markup = InlineKeyboardMarkup(keyboard)
                     await update.message.reply_text("✅ Return confirmed! 📸 Photo saved.", reply_markup=reply_markup, parse_mode="Markdown")
                 else:
-                    await update.message.reply_text("❌ Error saving return. Please try again.\n\n_Type 'cancel' to go back._", parse_mode="Markdown")
+                    keyboard = [[InlineKeyboardButton("🔙 Back to Menu", callback_data="back_to_menu")]]
+                    reply_markup = InlineKeyboardMarkup(keyboard)
+                    await update.message.reply_text("❌ Error saving return. Please try again.", reply_markup=reply_markup, parse_mode="Markdown")
                 context.user_data.clear()
-                return ConversationHandler.END
+                # Stay in MAIN_MENU: ending here would leave the Back to Menu
+                # button above with no handler, forcing the user to type /start.
+                return MAIN_MENU
             else:
                 await update.message.reply_text("❌ Please send a photo!\n\n_(Type 'cancel' to go back)_", parse_mode="Markdown")
                 return CONFIRM_RETURN_PHOTO
@@ -701,14 +722,18 @@ async def receive_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     parse_mode="Markdown"
                 )
             else:
+                keyboard = [[InlineKeyboardButton("🔙 Back to Menu", callback_data="back_to_menu")]]
+                reply_markup = InlineKeyboardMarkup(keyboard)
                 await update.message.reply_text(
-                    "❌ Error creating booking. This time slot may no longer be available.\n\n"
-                    "_Type 'cancel' to go back and try again._",
+                    "❌ Error creating booking. This time slot may no longer be available.",
+                    reply_markup=reply_markup,
                     parse_mode="Markdown"
                 )
 
             context.user_data.clear()
-            return ConversationHandler.END
+            # Stay in MAIN_MENU: ending here would leave the Back to Menu
+            # button above with no handler, forcing the user to type /start.
+            return MAIN_MENU
 
     except Exception as e:
         print(f"Error in receive_text: {e}")
@@ -745,7 +770,7 @@ def run_bot():
                     MessageHandler(filters.TEXT & ~filters.COMMAND, receive_text)
                 ],
             },
-            fallbacks=[],
+            fallbacks=[CommandHandler("start", start)],
         )
 
         app.add_handler(conv_handler)
