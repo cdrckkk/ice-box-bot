@@ -1,6 +1,6 @@
 import os
 import sqlite3
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, ConversationHandler,
@@ -14,6 +14,36 @@ DB_FILE = "ice_box_bookings.db"
 
 # Admin User ID (set this to your Telegram ID for admin access)
 ADMIN_USER_ID = 845290487  # Cedrick's admin ID
+
+# Singapore is permanently UTC+8 (no daylight saving), so a fixed offset is
+# safe and needs no timezone database. The server runs on UTC, so plain
+# datetime.now() would be 8 hours behind the user and must not be used.
+SGT = timezone(timedelta(hours=8))
+
+def now_sgt():
+    """Current time in Singapore, whatever timezone the server runs in."""
+    return datetime.now(SGT)
+
+def parse_booking_date(date_str, reference=None):
+    """Turn a 'DD/MM' string into a real date, choosing the year closest to
+    `reference`. Comparing these as plain text is wrong across a year
+    boundary: '01/10' < '30/09' is lexicographically true, which would treat
+    October bookings as already expired during September."""
+    reference = reference or now_sgt()
+    try:
+        day, month = (int(part) for part in date_str.split("/"))
+    except (ValueError, AttributeError):
+        return None
+    best = None
+    for year in (reference.year - 1, reference.year, reference.year + 1):
+        try:
+            candidate = datetime(year, month, day, tzinfo=SGT).date()
+        except ValueError:
+            continue  # e.g. 29/02 in a non-leap year
+        gap = abs((candidate - reference.date()).days)
+        if best is None or gap < best[0]:
+            best = (gap, candidate)
+    return best[1] if best else None
 
 def init_db():
     """Initialize database with tables."""
@@ -125,18 +155,23 @@ def add_booking(user_id, user_name, ice_box_id, start_time, end_time, booking_da
         traceback.print_exc()
         return None
 
-def get_user_bookings(user_id):
-    """Get all bookings for a user."""
+def get_user_bookings(user_id, include_returned=False):
+    """Get a user's bookings. Returned ones are hidden by default: once the
+    box is back and the photo is in, the booking is finished from the user's
+    side. The row stays in the database so /admin_returns keeps its record."""
     try:
         conn = sqlite3.connect(DB_FILE)
         cursor = conn.cursor()
 
-        cursor.execute('''
+        sql = '''
             SELECT id, ice_box_id, start_time, end_time, booking_date, is_returned, return_photo_id
             FROM bookings
             WHERE user_id = ?
-            ORDER BY booking_date DESC, start_time
-        ''', (user_id,))
+        '''
+        if not include_returned:
+            sql += " AND is_returned = 0"
+        sql += " ORDER BY booking_date DESC, start_time"
+        cursor.execute(sql, (user_id,))
 
         bookings = cursor.fetchall()
         conn.close()
@@ -182,7 +217,7 @@ def mark_booking_returned(booking_id, photo_id):
     try:
         conn = sqlite3.connect(DB_FILE)
         cursor = conn.cursor()
-        return_time = datetime.now().strftime("%d/%m %H:%M")
+        return_time = now_sgt().strftime("%d/%m %H:%M")
         cursor.execute(
             'UPDATE bookings SET is_returned = 1, return_photo_id = ?, return_time = ? WHERE id = ?',
             (photo_id, return_time, booking_id)
@@ -200,16 +235,18 @@ def delete_expired_bookings():
         conn = sqlite3.connect(DB_FILE)
         cursor = conn.cursor()
 
-        today = datetime.now().strftime("%d/%m")
-        current_time = datetime.now().strftime("%H:%M")
+        now = now_sgt()
+        today = now.date()
+        current_time = now.strftime("%H:%M")
 
         cursor.execute('SELECT id, booking_date, end_time FROM bookings')
         bookings = cursor.fetchall()
 
         for booking_id, booking_date, end_time in bookings:
-            if booking_date < today:
-                cursor.execute('DELETE FROM bookings WHERE id = ?', (booking_id,))
-            elif booking_date == today and end_time <= current_time:
+            booked = parse_booking_date(booking_date, now)
+            if booked is None:
+                continue
+            if booked < today or (booked == today and end_time <= current_time):
                 cursor.execute('DELETE FROM bookings WHERE id = ?', (booking_id,))
 
         conn.commit()
@@ -220,21 +257,38 @@ def delete_expired_bookings():
 # Conversation states
 MAIN_MENU, VIEW_MY_BOOKINGS, VIEW_ALL_BOOKINGS, SELECT_DATE, SELECT_START_TIME, SELECT_END_TIME, SELECT_ICE_BOX, ENTER_NAME, CONFIRM_RETURN_PHOTO = range(9)
 
-def generate_time_slots():
-    """Generate all 30-minute time slots from 00:00 to 23:30."""
+def generate_time_slots(booking_date=None):
+    """30-minute slots from 00:00 to 23:30. When booking_date is today, slots
+    that have already passed are left out, so you cannot book 10:00 at 23:00."""
+    now = now_sgt()
+    is_today = (booking_date is not None
+                and parse_booking_date(booking_date, now) == now.date())
+    current_time = now.strftime("%H:%M")
+
     slots = []
     for hour in range(24):
         for minute in [0, 30]:
-            slots.append(f"{hour:02d}:{minute:02d}")
+            slot = f"{hour:02d}:{minute:02d}"
+            if is_today and slot <= current_time:
+                continue
+            slots.append(slot)
     return slots
 
+def generate_start_slots(booking_date=None):
+    """Slots usable as a start time. The last slot of the day is excluded
+    because no later slot could serve as its end time."""
+    return generate_time_slots(booking_date)[:-1]
+
 def generate_date_buttons():
-    """Generate date buttons for next 7 days."""
-    today = datetime.now()
+    """Date buttons for the next 7 days. Today is dropped once all of its
+    slots have passed, so there is no dead button to tap late at night."""
+    today = now_sgt()
     dates = []
     for i in range(7):
         date = today + timedelta(days=i)
         date_str = date.strftime("%d/%m")
+        if i == 0 and not generate_start_slots(date_str):
+            continue
         label = f"Today ({date_str})" if i == 0 else f"Tomorrow ({date_str})" if i == 1 else date_str
         dates.append((label, date_str))
     return dates
@@ -384,8 +438,8 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             booking_date = query.data.split("_", 1)[1]
             context.user_data["booking_date"] = booking_date
 
-            # Show start time picker
-            time_slots = generate_time_slots()
+            # Show start time picker (past slots omitted when booking today)
+            time_slots = generate_start_slots(booking_date)
             keyboard = []
             for i in range(0, len(time_slots), 3):
                 row = [InlineKeyboardButton(time_slots[j], callback_data=f"start_time_{time_slots[j]}")
@@ -406,9 +460,9 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.user_data["start_time"] = start_time
 
             # Show end time picker (only times after start time)
-            time_slots = generate_time_slots()
-            start_idx = time_slots.index(start_time)
-            end_slots = time_slots[start_idx + 1:]
+            time_slots = generate_time_slots(context.user_data.get("booking_date"))
+            start_idx = time_slots.index(start_time) if start_time in time_slots else -1
+            end_slots = time_slots[start_idx + 1:] if start_idx >= 0 else []
 
             keyboard = []
             for i in range(0, len(end_slots), 3):
@@ -546,7 +600,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         elif query.data.startswith("view_photo_"):
             booking_id = int(query.data.split("_")[2])
-            bookings = get_user_bookings(query.from_user.id)
+            bookings = get_user_bookings(query.from_user.id, include_returned=True)
             booking = [b for b in bookings if b[0] == booking_id]
 
             if booking:
