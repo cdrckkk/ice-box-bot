@@ -664,8 +664,8 @@ async def receive_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data.clear()
         return ConversationHandler.END
 
-async def run_bot():
-    """Run the bot asynchronously."""
+def run_bot():
+    """Run the bot."""
     try:
         init_db()
 
@@ -700,17 +700,15 @@ async def run_bot():
         app.add_handler(CallbackQueryHandler(admin_photo_viewer, pattern="^admin_photo_"))
 
         print("🚀 Bot is running...")
-        await app.run_polling()
+        app.run_polling()
     except Exception as e:
         print(f"Error in run_bot: {e}")
         raise
 
 def main():
-    """Start the bot asynchronously."""
-    import asyncio
-
+    """Start the bot."""
     try:
-        asyncio.run(run_bot())
+        run_bot()
     except Exception as e:
         print(f"Error in main: {e}")
 
